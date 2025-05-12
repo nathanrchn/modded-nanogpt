@@ -208,6 +208,57 @@ class Muon(torch.optim.Optimizer):
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
+class AttentionEncoder(nn.Module):
+    def __init__(self, dim: int, num_heads: int, max_subtokens: int, pid: int):
+        super().__init__()
+        self.pid = pid
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std
+
+        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
+        self.positional_embedding = nn.Parameter(torch.empty(max_subtokens, dim).normal_(0, dim**-0.5))
+        self.c_proj = CastedLinear(dim, dim)
+        self.c_proj.weight.detach().zero_()
+
+    def forward(self, c: Tensor, e: Tensor):
+        _, H, S = c.shape
+        ce = F.embedding(c, e) + self.positional_embedding
+        q, k, v = F.linear(ce, self.qkv_w.flatten(end_dim=1).type_as(ce)).view(H, S, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k = norm(q), norm(k)
+
+        mask = c != self.pid
+        mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+        y = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            attn_mask=mask.unsqueeze(1),
+            scale=self.head_dim**-0.5,
+        ).transpose(1, 2)
+
+        y = y.contiguous().view(H, S, self.num_heads * self.head_dim)
+        return self.c_proj(y).mean(dim=1)
+    
+class HyperEmbedding(nn.Embedding):
+    def __init__(self, vocab_size: int, dim: int, num_heads: int, max_subtokens: int, pid: int):
+        super().__init__(vocab_size, dim, 0)
+
+        self.encoder = AttentionEncoder(dim, num_heads, max_subtokens=max_subtokens, pid=pid)
+
+    def forward(self, x: Tensor, c: Tensor):
+        bm = x < self.num_embeddings
+        hm = ~bm
+
+        bx = x * bm.long()
+        hx = (x - self.num_embeddings) * hm.long()
+
+        he = self.encoder(c, self.weight, self.pid).view(-1, self.dim)
+        hx += torch.arange(c.size(0), device=x.device, dtype=torch.long).unsqueeze(-1).expand_as(x) * c.size(1)
+
+        return F.embedding(bx, self.weight) * bm.unsqueeze(-1) + F.embedding(hx, he) * hm.unsqueeze(-1)
+
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
@@ -318,9 +369,10 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, max_subtokens: int, pid: int):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, model_dim)
+        self.vocab_size = vocab_size
+        self.embed = HyperEmbedding(vocab_size, model_dim, num_heads, max_subtokens, pid)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
@@ -330,6 +382,7 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
                                     use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
         self.lm_head.weight.detach().zero_() # @Grad62304977
+        self.encoder = AttentionEncoder(model_dim, num_heads, max_subtokens, pid)
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
         self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
@@ -374,7 +427,7 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor, codebook: Tensor):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -386,7 +439,7 @@ class GPT(nn.Module):
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = x0 = norm(self.embed(input_seq, codebook)[None]) # use of norm here by @Grad62304977
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -400,6 +453,11 @@ class GPT(nn.Module):
 
         x = norm(x)
         logits = self.lm_head(x).float()
+
+        xb = x.view(-1, 1024)
+        he = self.encoder(codebook, self.lm_head.weight)
+        hlogits = torch.bmm(xb, he.transpose(-2, -1)).flatten(start_dim=1).float()
+        logits = torch.cat([logits[..., : self.vocab_size], hlogits, logits[..., self.vocab_size:]], dim=-1)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
