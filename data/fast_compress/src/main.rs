@@ -71,7 +71,7 @@ fn compress(
     max_out_seq_length: usize,
     eot_token_id: usize,
     disabled_ids: &Set,
-) -> (Vec<usize>, Vec<Vec<usize>>, Option<usize>) {
+) -> (Vec<usize>, Vec<Vec<usize>>, usize) {
     let mut compressed_ids: Vec<usize> = Vec::new();
     let mut codebook: FxHashMap<Vec<usize>, usize> = FxHashMap::default();
 
@@ -138,19 +138,7 @@ fn compress(
 
     codebook_vec.resize(max_codebook_size, vec![eot_token_id; max_subtokens]);
 
-    let mut j = 0;
-    let mut has_remaining_docs = false;
-    while offset + i + j < num_tokens {
-        if ids[offset + i + j] == eot_token_id {
-            has_remaining_docs = true;
-            break;
-        }
-        j += 1;
-    }
-
-    let remaining_ids_offset = if has_remaining_docs { Some(i + j) } else { None };
-
-    (compressed_ids, codebook_vec, remaining_ids_offset)
+    (compressed_ids, codebook_vec, i)
 }
 
 fn compress_file(filename: &str, args: &Args) {
@@ -198,9 +186,8 @@ fn compress_file(filename: &str, args: &Args) {
             args.eot_token_id,
             &disabled_ids,
         );
-        let offset = remaining_ids_offset.unwrap_or(num_tokens - i);
-        let _ = pb.update(min(offset, num_tokens - i));
-        i += offset;
+        let _ = pb.update(min(remaining_ids_offset, num_tokens - i));
+        i += remaining_ids_offset;
 
         compressed_ids.extend(c_ids);
         codebook_vec.extend(c_codebook.iter().flatten().copied());

@@ -227,7 +227,6 @@ class AttentionEncoder(nn.Module):
         c = c.view(B * H, S)
         ce = F.embedding(c, e) + self.positional_embedding
         q, k, v = F.linear(ce, self.qkv_w.flatten(end_dim=1).type_as(ce)).view(B * H, S, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k)
 
         mask = c != self.pid
         mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
