@@ -217,8 +217,8 @@ class AttentionEncoder(nn.Module):
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std
 
-        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
-        self.positional_embedding = nn.Parameter(torch.empty(max_subtokens, dim).normal_(0, dim**-0.5))
+        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim, dtype=torch.bfloat16).uniform_(-bound, bound))
+        self.positional_embedding = nn.Parameter(torch.empty(max_subtokens, dim, dtype=torch.bfloat16).normal_(0, dim**-0.5))
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.detach().zero_()
 
@@ -456,8 +456,8 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
 
         xb = x.view(-1, 1024, x.size(-1))
-        he = self.encoder(codebook, self.lm_head.weight)
-        hlogits = torch.bmm(xb.float(), he.transpose(-2, -1)).view(1, -1, he.size(1))
+        he = self.encoder(codebook, self.lm_head.weight.bfloat16())
+        hlogits = torch.bmm(xb, he.transpose(-2, -1)).view(1, -1, he.size(1))
         logits = torch.cat([logits[..., : self.vocab_size], hlogits, logits[..., self.vocab_size:]], dim=-1).float()
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
@@ -487,14 +487,16 @@ def _load_data_shard(file: Path, codebook_file: Path):
     return tokens, codebooks, (max_codebook_size, max_subtokens)
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int, world_size: int):
-    files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
+    files = [Path(file) for file in sorted(glob.glob(filename_pattern.replace("fineweb_", "compressed_fineweb_")))]
+    codebooks_files = [Path(file) for file in sorted(glob.glob(filename_pattern.replace("fineweb_", "codebooks_fineweb_")))]
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
-    (tokens, codebooks, (mcs, ms)), pos, codebook_pos = _load_data_shard(next(file_iter)), 0, 0
+    codebooks_iter = iter(codebooks_files)
+    (tokens, codebooks, (mcs, ms)), pos, codebook_pos = _load_data_shard(next(file_iter), next(codebooks_iter)), 0, 0
     while True:
         if pos + batch_size + 1 >= len(tokens):
-            (tokens, codebooks, (mcs, ms)), pos, codebook_pos = _load_data_shard(next(file_iter)), 0, 0
+            (tokens, codebooks, (mcs, ms)), pos, codebook_pos = _load_data_shard(next(file_iter), next(codebooks_iter)), 0, 0
         buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
@@ -515,8 +517,8 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 24*1024 # FlexAttention sequence length
-    val_seq_len = 2*64*1024 # FlexAttention sequence length for validation
+    train_seq_len = 48*1024 # FlexAttention sequence length
+    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
     num_iterations = 1770 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
@@ -533,7 +535,7 @@ args = Hyperparameters()
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-# assert world_size == 8 # this code is designed for 8xH100
+assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -581,6 +583,7 @@ for param in model.parameters():
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+encoder_matrix_params = [p for n, p in model.named_parameters() if p.ndim >= 2 and "encoder" in n]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
@@ -590,7 +593,7 @@ adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2 = Muon(hidden_matrix_params + encoder_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
