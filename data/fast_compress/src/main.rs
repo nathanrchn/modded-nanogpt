@@ -80,7 +80,7 @@ fn compress(
     let mut ids_to_merge: Vec<usize> = Vec::with_capacity(max_subtokens);
 
     let mut i = 0;
-    while i < ids.len() && i < max_out_seq_length - 1 {
+    while i < ids.len() && i < max_out_seq_length {
         let id = ids[i + offset];
 
         if disabled_ids.contains(&id) {
@@ -116,14 +116,14 @@ fn compress(
         i += 1;
     }
 
-    if ids_to_merge.len() > max_subtokens {
+    if ids_to_merge.len() > max_subtokens && compressed_ids.len() < max_out_seq_length {
         let last_id = ids_to_merge.pop().unwrap();
         compressed_ids.push(get_usize_from_codebook(&codebook, &ids_to_merge));
         ids_to_merge.clear();
         ids_to_merge.push(last_id);
     }
 
-    if ids_to_merge.len() > 0 {
+    if ids_to_merge.len() > 0 && compressed_ids.len() < max_out_seq_length {
         compressed_ids.push(get_usize_from_codebook(&codebook, &ids_to_merge));
     }
 
@@ -215,6 +215,9 @@ fn main() {
         println!("codebook_vec.len(): {}", codebook_vec.len());
 
         header[2] = compressed_ids.len() as i32;
+        header[3] = codebook_vec.len() as i32;
+        header[4] = args.max_codebook_size as i32;
+        header[5] = args.max_subtokens as i32;
 
         let mut compressed_file = File::create(format!("../{}/compressed_fineweb_{}_{:06}.bin", args.name, args.split, chunk)).unwrap();
         let header_bytes: Vec<u8> = header.iter().flat_map(|&x| x.to_le_bytes()).collect();

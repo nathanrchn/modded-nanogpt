@@ -427,7 +427,7 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor, codebook: Tensor):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, codebook: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -466,7 +466,7 @@ class GPT(nn.Module):
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
 
-def _load_data_shard(file: Path):
+def _load_data_shard(file: Path, codebook_file: Path):
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
@@ -476,22 +476,34 @@ def _load_data_shard(file: Path):
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
-    return tokens
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
+    num_codebook = int(header[3])
+    max_codebook_size = int(header[4])
+    max_subtokens = int(header[5])
+    with codebook_file.open("rb", buffering=0) as f:
+        codebooks = torch.empty(num_codebook * max_codebook_size * max_subtokens, dtype=torch.uint16, pin_memory=True)
+        nbytes = f.readinto(codebooks.numpy())
+    return tokens, codebooks, (max_codebook_size, max_subtokens)
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int, world_size: int):
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
-    tokens, pos = _load_data_shard(next(file_iter)), 0
+    (tokens, codebooks, (mcs, ms)), pos, codebook_pos = _load_data_shard(next(file_iter)), 0, 0
     while True:
         if pos + batch_size + 1 >= len(tokens):
-            tokens, pos = _load_data_shard(next(file_iter)), 0
+            (tokens, codebooks, (mcs, ms)), pos, codebook_pos = _load_data_shard(next(file_iter)), 0, 0
         buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
         pos += batch_size
-        yield inputs, targets
+
+        local_codebook_batch_size = local_batch_size // 1024
+        codebook = codebooks[codebook_pos + rank * local_codebook_batch_size * mcs * ms:][:local_codebook_batch_size * mcs * ms]
+        codebook = codebook.view(local_codebook_batch_size, mcs, ms).to(device="cuda", dtype=torch.int32, non_blocking=True)
+        codebook_pos += local_codebook_batch_size * mcs * ms
+        yield inputs, targets, codebook
 
 # -----------------------------------------------------------------------------
 # int main
@@ -512,6 +524,9 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    # zip2zip
+    max_codebook_size = 1024
+    max_subtokens = 4
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -614,7 +629,8 @@ initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+    codebook = torch.randint(0, args.vocab_size, size=(args.max_codebook_size, args.max_subtokens), device="cuda")
+    model(inputs.to(torch.int32), targets, codebook, get_window_size_blocks(0)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     for opt in optimizers:
@@ -652,8 +668,8 @@ for step in range(train_steps + 1):
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
-                inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
+                inputs, targets, codebook = next(val_loader)
+                val_loss += model(inputs, targets, codebook, get_window_size_blocks(step))
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -672,8 +688,8 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    inputs, targets, codebook = next(train_loader)
+    model(inputs, targets, codebook, get_window_size_blocks(step)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     # set optimization hyperparameters
