@@ -478,11 +478,11 @@ def _load_data_shard(file: Path, codebook_file: Path):
         nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
 
-    num_codebook = int(header[3])
+    num_codebooks = int(header[3])
     max_codebook_size = int(header[4])
     max_subtokens = int(header[5])
     with codebook_file.open("rb", buffering=0) as f:
-        codebooks = torch.empty(num_codebook * max_codebook_size * max_subtokens, dtype=torch.uint16, pin_memory=True)
+        codebooks = torch.empty(num_codebooks * max_codebook_size * max_subtokens, dtype=torch.uint16, pin_memory=True)
         nbytes = f.readinto(codebooks.numpy())
     return tokens, codebooks, (max_codebook_size, max_subtokens)
 
@@ -505,7 +505,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int
         local_codebook_batch_size = local_batch_size // 1024
         codebook = codebooks[codebook_pos + rank * local_codebook_batch_size * mcs * ms:][:local_codebook_batch_size * mcs * ms]
         codebook = codebook.view(local_codebook_batch_size, mcs, ms).to(device="cuda", dtype=torch.int32, non_blocking=True)
-        codebook_pos += local_codebook_batch_size * mcs * ms
+        codebook_pos += world_size * local_codebook_batch_size * mcs * ms
         yield inputs, targets, codebook
 
 # -----------------------------------------------------------------------------

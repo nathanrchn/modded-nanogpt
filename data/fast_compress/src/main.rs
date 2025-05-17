@@ -209,7 +209,7 @@ fn compress_file(filename: &str, args: &Args) {
     println!("codebook_vec.len(): {}", codebook_vec.len());
 
     header[2] = compressed_ids.len() as i32;
-    header[3] = codebook_vec.len() as i32;
+    header[3] = (codebook_vec.len() / (args.max_codebook_size * args.max_subtokens)) as i32;
     header[4] = args.max_codebook_size as i32;
     header[5] = args.max_subtokens as i32;
 
