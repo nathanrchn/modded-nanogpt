@@ -64,6 +64,7 @@ fn disabled_ids_to_set(disabled_ids: Option<Vec<usize>>) -> Set {
 fn compress(
     ids: &[usize],
     offset: usize,
+    num_tokens: usize,
     initial_vocab_size: usize,
     max_codebook_size: usize,
     max_subtokens: usize,
@@ -78,8 +79,8 @@ fn compress(
     let mut ids_to_merge: Vec<usize> = Vec::with_capacity(max_subtokens);
 
     let mut i = 0;
-    while i < ids.len() && i < max_out_seq_length {
-        let id = ids[i + offset];
+    while offset + i < num_tokens && compressed_ids.len() < max_out_seq_length {
+        let id = ids[offset + i];
 
         if disabled_ids.contains(&id) {
             if ids_to_merge.len() > 0 {
@@ -137,19 +138,19 @@ fn compress(
 
     codebook_vec.resize(max_codebook_size, vec![eot_token_id; max_subtokens]);
 
-    let mut j = i;
+    let mut j = 0;
     let mut has_remaining_docs = false;
-    while j < ids.len() {
-        if ids[j] == eot_token_id {
+    while offset + i + j < num_tokens {
+        if ids[offset + i + j] == eot_token_id {
             has_remaining_docs = true;
             break;
         }
         j += 1;
     }
 
-    let remaining_ids = if has_remaining_docs { Some(j) } else { None };
+    let remaining_ids_offset = if has_remaining_docs { Some(i + j) } else { None };
 
-    (compressed_ids, codebook_vec, remaining_ids)
+    (compressed_ids, codebook_vec, remaining_ids_offset)
 }
 
 fn compress_file(filename: &str, args: &Args) {
@@ -176,7 +177,7 @@ fn compress_file(filename: &str, args: &Args) {
         "magic number mismatch in the data .bin file"
     );
     assert!(header[1] == 1, "unsupported version");
-    let num_tokens = header[2];
+    let num_tokens = header[2] as usize;
 
     let disabled_ids = disabled_ids_to_set(Some(vec![args.eot_token_id]));
 
@@ -184,11 +185,12 @@ fn compress_file(filename: &str, args: &Args) {
     let mut codebook_vec: Vec<usize> = Vec::new();
 
     let mut i: usize = 0;
-    let mut pb = pbar(Some(num_tokens as usize));
-    while i < num_tokens as usize {
-        let (c_ids, c_codebook, remaining_ids) = compress(
+    let mut pb = pbar(Some(num_tokens));
+    while i < num_tokens {
+        let (c_ids, c_codebook, remaining_ids_offset) = compress(
             &ids,
             i,
+            num_tokens,
             args.initial_vocab_size,
             args.max_codebook_size,
             args.max_subtokens,
@@ -196,8 +198,8 @@ fn compress_file(filename: &str, args: &Args) {
             args.eot_token_id,
             &disabled_ids,
         );
-        let offset = remaining_ids.unwrap_or(num_tokens as usize - i);
-        let _ = pb.update(min(offset, num_tokens as usize - i));
+        let offset = remaining_ids_offset.unwrap_or(num_tokens - i);
+        let _ = pb.update(min(offset, num_tokens - i));
         i += offset;
 
         compressed_ids.extend(c_ids);
@@ -213,14 +215,22 @@ fn compress_file(filename: &str, args: &Args) {
     header[4] = args.max_codebook_size as i32;
     header[5] = args.max_subtokens as i32;
 
-    let mut compressed_file = File::create(format!("../{}/compressed_{}", args.name, filename)).unwrap();
+    let mut compressed_file =
+        File::create(format!("../{}/compressed_{}", args.name, filename)).unwrap();
     let header_bytes: Vec<u8> = header.iter().flat_map(|&x| x.to_le_bytes()).collect();
     compressed_file.write_all(&header_bytes).unwrap();
-    let compressed_ids_bytes: Vec<u8> = compressed_ids.iter().flat_map(|&x| (x as u16).to_le_bytes()).collect();
+    let compressed_ids_bytes: Vec<u8> = compressed_ids
+        .iter()
+        .flat_map(|&x| (x as u16).to_le_bytes())
+        .collect();
     compressed_file.write_all(&compressed_ids_bytes).unwrap();
 
-    let mut codebook_file = File::create(format!("../{}/codebooks_{}", args.name, filename)).unwrap();
-    let codebook_bytes: Vec<u8> = codebook_vec.iter().flat_map(|&x| (x as u16).to_le_bytes()).collect();
+    let mut codebook_file =
+        File::create(format!("../{}/codebooks_{}", args.name, filename)).unwrap();
+    let codebook_bytes: Vec<u8> = codebook_vec
+        .iter()
+        .flat_map(|&x| (x as u16).to_le_bytes())
+        .collect();
     codebook_file.write_all(&codebook_bytes).unwrap();
 }
 
