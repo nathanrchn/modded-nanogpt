@@ -11,8 +11,6 @@ use tqdm::pbar;
 struct Args {
     #[arg(short, long, default_value = "fineweb10B")]
     name: String,
-    #[arg(short, long, default_value = "val")]
-    split: String,
     #[arg(long, default_value = "1")]
     num_chunks: usize,
     #[arg(long, default_value = "50257")]
@@ -154,79 +152,86 @@ fn compress(
     (compressed_ids, codebook_vec, remaining_ids)
 }
 
+fn compress_file(filename: &str, args: &Args) {
+    let file = File::open(format!("../{}/{}", args.name, filename)).unwrap();
+    let mut reader = BufReader::new(file);
+
+    let mut header_buffer = vec![0u8; 256 * 4];
+    reader.read_exact(&mut header_buffer).unwrap();
+    let mut header: Vec<i32> = header_buffer
+        .chunks_exact(4)
+        .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+
+    let mut ids_buffer = Vec::new();
+    reader.read_to_end(&mut ids_buffer).unwrap();
+
+    let ids: Vec<usize> = ids_buffer
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]) as usize)
+        .collect();
+
+    assert!(
+        header[0] == 20240520,
+        "magic number mismatch in the data .bin file"
+    );
+    assert!(header[1] == 1, "unsupported version");
+    let num_tokens = header[2];
+
+    let disabled_ids = disabled_ids_to_set(Some(vec![args.eot_token_id]));
+
+    let mut compressed_ids: Vec<usize> = Vec::new();
+    let mut codebook_vec: Vec<usize> = Vec::new();
+
+    let mut i: usize = 0;
+    let mut pb = pbar(Some(num_tokens as usize));
+    while i < num_tokens as usize {
+        let (c_ids, c_codebook, remaining_ids) = compress(
+            &ids,
+            i,
+            args.initial_vocab_size,
+            args.max_codebook_size,
+            args.max_subtokens,
+            args.max_out_seq_length,
+            args.eot_token_id,
+            &disabled_ids,
+        );
+        let offset = remaining_ids.unwrap_or(num_tokens as usize - i);
+        let _ = pb.update(min(offset, num_tokens as usize - i));
+        i += offset;
+
+        compressed_ids.extend(c_ids);
+        codebook_vec.extend(c_codebook.iter().flatten().copied());
+    }
+    let _ = pb.close();
+
+    println!("compressed_ids.len(): {}", compressed_ids.len());
+    println!("codebook_vec.len(): {}", codebook_vec.len());
+
+    header[2] = compressed_ids.len() as i32;
+    header[3] = codebook_vec.len() as i32;
+    header[4] = args.max_codebook_size as i32;
+    header[5] = args.max_subtokens as i32;
+
+    let mut compressed_file = File::create(format!("../{}/compressed_{}", args.name, filename)).unwrap();
+    let header_bytes: Vec<u8> = header.iter().flat_map(|&x| x.to_le_bytes()).collect();
+    compressed_file.write_all(&header_bytes).unwrap();
+    let compressed_ids_bytes: Vec<u8> = compressed_ids.iter().flat_map(|&x| (x as u16).to_le_bytes()).collect();
+    compressed_file.write_all(&compressed_ids_bytes).unwrap();
+
+    let mut codebook_file = File::create(format!("../{}/codebooks_{}", args.name, filename)).unwrap();
+    let codebook_bytes: Vec<u8> = codebook_vec.iter().flat_map(|&x| (x as u16).to_le_bytes()).collect();
+    codebook_file.write_all(&codebook_bytes).unwrap();
+}
+
 fn main() {
     let args = Args::parse();
 
-    for chunk in 0..args.num_chunks {
-        let filename = format!("../{}/fineweb_{}_{:06}.bin", args.name, args.split, chunk);
-        let file = File::open(filename).unwrap();
-        let mut reader = BufReader::new(file);
+    let mut filename = format!("fineweb_val_{:06}.bin", 0);
+    compress_file(&filename, &args);
 
-        let mut header_buffer = vec![0u8; 256 * 4];
-        reader.read_exact(&mut header_buffer).unwrap();
-        let mut header: Vec<i32> = header_buffer
-            .chunks_exact(4)
-            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-
-        let mut ids_buffer = Vec::new();
-        reader.read_to_end(&mut ids_buffer).unwrap();
-
-        let ids: Vec<usize> = ids_buffer
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]) as usize)
-            .collect();
-
-        assert!(
-            header[0] == 20240520,
-            "magic number mismatch in the data .bin file"
-        );
-        assert!(header[1] == 1, "unsupported version");
-        let num_tokens = header[2];
-
-        let disabled_ids = disabled_ids_to_set(Some(vec![args.eot_token_id]));
-
-        let mut compressed_ids: Vec<usize> = Vec::new();
-        let mut codebook_vec: Vec<usize> = Vec::new();
-
-        let mut i: usize = 0;
-        let mut pb = pbar(Some(num_tokens as usize));
-        while i < num_tokens as usize {
-            let (c_ids, c_codebook, remaining_ids) = compress(
-                &ids,
-                i,
-                args.initial_vocab_size,
-                args.max_codebook_size,
-                args.max_subtokens,
-                args.max_out_seq_length,
-                args.eot_token_id,
-                &disabled_ids,
-            );
-            let offset = remaining_ids.unwrap_or(num_tokens as usize - i);
-            let _ = pb.update(min(offset, num_tokens as usize - i));
-            i += offset;
-
-            compressed_ids.extend(c_ids);
-            codebook_vec.extend(c_codebook.iter().flatten().copied());
-        }
-        let _ = pb.close();
-
-        println!("compressed_ids.len(): {}", compressed_ids.len());
-        println!("codebook_vec.len(): {}", codebook_vec.len());
-
-        header[2] = compressed_ids.len() as i32;
-        header[3] = codebook_vec.len() as i32;
-        header[4] = args.max_codebook_size as i32;
-        header[5] = args.max_subtokens as i32;
-
-        let mut compressed_file = File::create(format!("../{}/compressed_fineweb_{}_{:06}.bin", args.name, args.split, chunk)).unwrap();
-        let header_bytes: Vec<u8> = header.iter().flat_map(|&x| x.to_le_bytes()).collect();
-        compressed_file.write_all(&header_bytes).unwrap();
-        let compressed_ids_bytes: Vec<u8> = compressed_ids.iter().flat_map(|&x| (x as u16).to_le_bytes()).collect();
-        compressed_file.write_all(&compressed_ids_bytes).unwrap();
-
-        let mut codebook_file = File::create(format!("../{}/codebooks_fineweb_{}_{:06}.bin", args.name, args.split, chunk)).unwrap();
-        let codebook_bytes: Vec<u8> = codebook_vec.iter().flat_map(|&x| (x as u16).to_le_bytes()).collect();
-        codebook_file.write_all(&codebook_bytes).unwrap();
+    for chunk in 1..args.num_chunks + 1 {
+        filename = format!("fineweb_train_{:06}.bin", chunk);
+        compress_file(&filename, &args);
     }
 }

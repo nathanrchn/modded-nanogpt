@@ -223,9 +223,10 @@ class AttentionEncoder(nn.Module):
         self.c_proj.weight.detach().zero_()
 
     def forward(self, c: Tensor, e: Tensor):
-        _, H, S = c.shape
+        B, H, S = c.shape
+        c = c.view(B * H, S)
         ce = F.embedding(c, e) + self.positional_embedding
-        q, k, v = F.linear(ce, self.qkv_w.flatten(end_dim=1).type_as(ce)).view(H, S, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k, v = F.linear(ce, self.qkv_w.flatten(end_dim=1).type_as(ce)).view(B * H, S, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k)
 
         mask = c != self.pid
@@ -238,8 +239,8 @@ class AttentionEncoder(nn.Module):
             scale=self.head_dim**-0.5,
         ).transpose(1, 2)
 
-        y = y.contiguous().view(H, S, self.num_heads * self.head_dim)
-        return self.c_proj(y).mean(dim=1)
+        y = y.contiguous().view(B, H, S, self.num_heads * self.head_dim)
+        return self.c_proj(y).mean(dim=2)
     
 class HyperEmbedding(nn.Embedding):
     def __init__(self, vocab_size: int, dim: int, num_heads: int, max_subtokens: int, pid: int):
@@ -254,8 +255,8 @@ class HyperEmbedding(nn.Embedding):
         bx = x * bm.long()
         hx = (x - self.num_embeddings) * hm.long()
 
-        he = self.encoder(c, self.weight, self.pid).view(-1, self.dim)
-        hx += torch.arange(c.size(0), device=x.device, dtype=torch.long).unsqueeze(-1).expand_as(x) * c.size(1)
+        he = self.encoder(c, self.weight).view(-1, self.embedding_dim)
+        hx += torch.arange(x.size(0), device=x.device, dtype=torch.long).unsqueeze(-1).expand_as(x) * c.size(1)
 
         return F.embedding(bx, self.weight) * bm.unsqueeze(-1) + F.embedding(hx, he) * hm.unsqueeze(-1)
 
@@ -439,7 +440,7 @@ class GPT(nn.Module):
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq, codebook)[None]) # use of norm here by @Grad62304977
+        x = x0 = norm(self.embed(input_seq[None], codebook)) # use of norm here by @Grad62304977
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -452,12 +453,12 @@ class GPT(nn.Module):
                 skip_connections.append(x)
 
         x = norm(x)
-        logits = self.lm_head(x).float()
+        logits = self.lm_head(x)
 
-        xb = x.view(-1, 1024)
+        xb = x.view(-1, 1024, x.size(-1))
         he = self.encoder(codebook, self.lm_head.weight)
-        hlogits = torch.bmm(xb, he.transpose(-2, -1)).flatten(start_dim=1).float()
-        logits = torch.cat([logits[..., : self.vocab_size], hlogits, logits[..., self.vocab_size:]], dim=-1)
+        hlogits = torch.bmm(xb.float(), he.transpose(-2, -1)).view(1, -1, he.size(1))
+        logits = torch.cat([logits[..., : self.vocab_size], hlogits, logits[..., self.vocab_size:]], dim=-1).float()
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
@@ -514,8 +515,8 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    train_seq_len = 24*1024 # FlexAttention sequence length
+    val_seq_len = 2*64*1024 # FlexAttention sequence length for validation
     # optimization
     num_iterations = 1770 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
@@ -532,7 +533,7 @@ args = Hyperparameters()
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+# assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -571,7 +572,7 @@ print0("="*100)
 ########################################
 
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
-                       max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+                       max_seq_len=max(args.train_seq_len, args.val_seq_len), max_subtokens=4, pid=50256).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -629,7 +630,7 @@ initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    codebook = torch.randint(0, args.vocab_size, size=(args.max_codebook_size, args.max_subtokens), device="cuda")
+    codebook = torch.randint(0, args.vocab_size, size=(args.train_seq_len // 1024, args.max_codebook_size, args.max_subtokens), device="cuda")
     model(inputs.to(torch.int32), targets, codebook, get_window_size_blocks(0)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
