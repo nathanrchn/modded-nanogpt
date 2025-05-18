@@ -61,6 +61,13 @@ fn disabled_ids_to_set(disabled_ids: Option<Vec<usize>>) -> Set {
     )
 }
 
+#[inline(always)]
+fn push_to_compressed_ids(compressed_ids: &mut Vec<usize>, id: usize, max_out_seq_length: usize) {
+    if compressed_ids.len() < max_out_seq_length {
+        compressed_ids.push(id);
+    }
+}
+
 fn compress(
     ids: &[usize],
     offset: usize,
@@ -71,12 +78,16 @@ fn compress(
     max_out_seq_length: usize,
     eot_token_id: usize,
     disabled_ids: &Set,
-) -> (Vec<usize>, Vec<Vec<usize>>, usize) {
-    let mut compressed_ids: Vec<usize> = Vec::new();
+) -> (Vec<usize>, Vec<usize>, usize) {
+    let mut compressed_ids: Vec<usize> = Vec::with_capacity(max_out_seq_length);
     let mut codebook: FxHashMap<Vec<usize>, usize> = FxHashMap::default();
 
     let mut next_id: usize = initial_vocab_size;
     let mut ids_to_merge: Vec<usize> = Vec::with_capacity(max_subtokens);
+
+    if ids[offset] != eot_token_id {
+        compressed_ids.push(eot_token_id);
+    }
 
     let mut i = 0;
     while offset + i < num_tokens && compressed_ids.len() < max_out_seq_length {
@@ -84,10 +95,14 @@ fn compress(
 
         if disabled_ids.contains(&id) {
             if ids_to_merge.len() > 0 {
-                compressed_ids.push(get_usize_from_codebook(&codebook, &ids_to_merge));
+                push_to_compressed_ids(
+                    &mut compressed_ids,
+                    get_usize_from_codebook(&codebook, &ids_to_merge),
+                    max_out_seq_length,
+                );
                 ids_to_merge.clear();
             }
-            compressed_ids.push(id);
+            push_to_compressed_ids(&mut compressed_ids, id, max_out_seq_length);
             i += 1;
             continue;
         }
@@ -102,41 +117,57 @@ fn compress(
             }
 
             ids_to_merge.pop();
-            compressed_ids.push(get_usize_from_codebook(&codebook, &ids_to_merge));
+            push_to_compressed_ids(
+                &mut compressed_ids,
+                get_usize_from_codebook(&codebook, &ids_to_merge),
+                max_out_seq_length,
+            );
             ids_to_merge.clear();
             ids_to_merge.push(id);
         }
 
         if ids_to_merge.len() == max_subtokens {
-            compressed_ids.push(get_usize_from_codebook(&codebook, &ids_to_merge));
+            push_to_compressed_ids(
+                &mut compressed_ids,
+                get_usize_from_codebook(&codebook, &ids_to_merge),
+                max_out_seq_length,
+            );
             ids_to_merge.clear();
         }
 
         i += 1;
     }
 
-    if ids_to_merge.len() > max_subtokens && compressed_ids.len() < max_out_seq_length {
+    if ids_to_merge.len() > max_subtokens {
         let last_id = ids_to_merge.pop().unwrap();
-        compressed_ids.push(get_usize_from_codebook(&codebook, &ids_to_merge));
+        push_to_compressed_ids(
+            &mut compressed_ids,
+            get_usize_from_codebook(&codebook, &ids_to_merge),
+            max_out_seq_length,
+        );
         ids_to_merge.clear();
         ids_to_merge.push(last_id);
     }
 
-    if ids_to_merge.len() > 0 && compressed_ids.len() < max_out_seq_length {
-        compressed_ids.push(get_usize_from_codebook(&codebook, &ids_to_merge));
+    if ids_to_merge.len() > 0 {
+        push_to_compressed_ids(
+            &mut compressed_ids,
+            get_usize_from_codebook(&codebook, &ids_to_merge),
+            max_out_seq_length,
+        );
     }
 
-    let mut codebook_vec: Vec<Vec<usize>> = codebook
+    let mut codebook_vec: Vec<usize> = codebook
         .iter()
         .sorted_by(|(_, value), (_, value2)| value.cmp(value2))
-        .map(|(key, _)| {
+        .flat_map(|(key, _)| {
             let mut k = key.clone();
             k.resize(max_subtokens, eot_token_id);
             k
         })
-        .collect::<Vec<Vec<usize>>>();
+        .collect::<Vec<usize>>();
 
-    codebook_vec.resize(max_codebook_size, vec![eot_token_id; max_subtokens]);
+    codebook_vec.resize(max_codebook_size * max_subtokens, eot_token_id);
 
     (compressed_ids, codebook_vec, i)
 }
@@ -174,7 +205,7 @@ fn compress_file(filename: &str, args: &Args) {
 
     let mut i: usize = 0;
     let mut pb = pbar(Some(num_tokens));
-    while i < num_tokens {
+    while i < num_tokens && (num_tokens - i) > args.max_out_seq_length {
         let (c_ids, c_codebook, remaining_ids_offset) = compress(
             &ids,
             i,
@@ -189,8 +220,13 @@ fn compress_file(filename: &str, args: &Args) {
         let _ = pb.update(min(remaining_ids_offset, num_tokens - i));
         i += remaining_ids_offset;
 
+        if c_ids.len() != args.max_out_seq_length {
+            println!("c_ids.len(): {}", c_ids.len());
+            return;
+        }
+
         compressed_ids.extend(c_ids);
-        codebook_vec.extend(c_codebook.iter().flatten().copied());
+        codebook_vec.extend(c_codebook);
     }
     let _ = pb.close();
 
