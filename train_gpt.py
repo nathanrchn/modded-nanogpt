@@ -217,15 +217,15 @@ class AttentionEncoder(nn.Module):
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std
 
-        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim, dtype=torch.bfloat16).uniform_(-bound, bound))
-        self.positional_embedding = nn.Parameter(torch.empty(max_subtokens, dim, dtype=torch.bfloat16).normal_(0, dim**-0.5))
+        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
+        self.positional_embedding = nn.Parameter(torch.empty(max_subtokens, dim).normal_(0, dim**-0.5))
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.detach().zero_()
 
     def forward(self, c: Tensor, e: Tensor):
         B, H, S = c.shape
         c = c.view(B * H, S)
-        ce = F.embedding(c, e) + self.positional_embedding
+        ce = F.embedding(c, e) + self.positional_embedding.type_as(e)
         q, k, v = F.linear(ce, self.qkv_w.flatten(end_dim=1).type_as(ce)).view(B * H, S, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
 
         mask = c != self.pid
@@ -375,7 +375,7 @@ class GPT(nn.Module):
         self.embed = HyperEmbedding(vocab_size, model_dim, num_heads, max_subtokens, pid)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
+        self.value_embeds = nn.ModuleList([HyperEmbedding(vocab_size, model_dim, num_heads, max_subtokens, pid) for _ in range(3)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -430,7 +430,7 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, codebook: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+        ve = [value_embed(input_seq[None], codebook)[0] for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
@@ -517,7 +517,7 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    val_seq_len = 48*1024 # 4*64*1024 # FlexAttention sequence length for validation
     # optimization
     num_iterations = 1770 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
@@ -534,7 +534,7 @@ args = Hyperparameters()
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+# assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -575,7 +575,7 @@ print0("="*100)
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
                        max_seq_len=max(args.train_seq_len, args.val_seq_len), max_subtokens=4, pid=50256).cuda()
 for m in model.modules():
-    if isinstance(m, nn.Embedding):
+    if isinstance(m, HyperEmbedding):
         m.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
