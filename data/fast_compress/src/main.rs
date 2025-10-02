@@ -103,6 +103,7 @@ fn compress_file(filename: &str, args: &Args) {
             return;
         }
 
+        compressed_ids.push(args.eot_token_id);
         compressed_ids.extend(c_ids);
         codebook_vec.extend(convert_codebook_to_vec(&compression_state.codebook));
     }

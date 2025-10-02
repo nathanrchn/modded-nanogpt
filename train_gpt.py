@@ -227,6 +227,7 @@ class AttentionEncoder(nn.Module):
         c = c.view(B * H, S)
         ce = F.embedding(c, e) + self.positional_embedding.type_as(e)
         q, k, v = F.linear(ce, self.qkv_w.flatten(end_dim=1).type_as(ce)).view(B * H, S, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k = norm(q), norm(k)
 
         mask = c != self.pid
         mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
@@ -515,7 +516,7 @@ class Hyperparameters:
     # data
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens = 10469376 # 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 48*1024 # 4*64*1024 # FlexAttention sequence length for validation
     # optimization
