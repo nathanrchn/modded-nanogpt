@@ -5,7 +5,5 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
-fastset = "0.4.1"
-itertools = "0.14.0"
-rustc-hash = "2.1.1"
 tqdm = "0.7.0"
+zip2zip_compression = { git = "https://github.com/epfl-dlab/zip2zip-compression", version = "0.3.3" }

@@ -1,11 +1,9 @@
 use clap::Parser;
-use fastset::Set;
-use itertools::Itertools;
-use rustc_hash::FxHashMap;
 use std::cmp::min;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use tqdm::pbar;
+use zip2zip_compression::{codec, config};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -25,151 +23,25 @@ struct Args {
     eot_token_id: usize,
 }
 
-#[inline(always)]
-fn codebook_contains(
-    codebook: &FxHashMap<Vec<usize>, usize>,
-    ids: &Vec<usize>,
-    initial_vocab_size: usize,
-) -> bool {
-    if ids.len() == 1 {
-        ids[0] < initial_vocab_size
-    } else {
-        codebook.contains_key(ids)
-    }
-}
+fn convert_codebook_to_vec(codebook: &codec::Codebook) -> Vec<usize> {
+    let config = codebook.config.clone();
+    let total_size = config.max_codebook_size * config.max_subtokens;
+    let mut output = vec![config.pad_token_id; total_size];
 
-#[inline(always)]
-fn get_usize_from_codebook(codebook: &FxHashMap<Vec<usize>, usize>, ids: &Vec<usize>) -> usize {
-    if ids.len() == 1 {
-        ids[0]
-    } else {
-        codebook.get(ids).unwrap().clone()
-    }
-}
+    let mut entries: Vec<_> = codebook.inner.iter().collect();
+    entries.sort_by_key(|(_, id)| *id);
 
-#[inline(always)]
-fn disabled_ids_to_set(disabled_ids: Option<Vec<usize>>) -> Set {
-    disabled_ids.map_or_else(
-        || Set::with_capacity(0),
-        |d_ids| {
-            let mut set = Set::with_capacity(d_ids.iter().max().unwrap() + 1);
-            for id in d_ids {
-                set.insert(id);
-            }
-            set
-        },
-    )
-}
-
-#[inline(always)]
-fn push_to_compressed_ids(compressed_ids: &mut Vec<usize>, id: usize, max_out_seq_length: usize) {
-    if compressed_ids.len() < max_out_seq_length {
-        compressed_ids.push(id);
-    }
-}
-
-fn compress(
-    ids: &[usize],
-    offset: usize,
-    num_tokens: usize,
-    initial_vocab_size: usize,
-    max_codebook_size: usize,
-    max_subtokens: usize,
-    max_out_seq_length: usize,
-    eot_token_id: usize,
-    disabled_ids: &Set,
-) -> (Vec<usize>, Vec<usize>, usize) {
-    let mut compressed_ids: Vec<usize> = Vec::with_capacity(max_out_seq_length);
-    let mut codebook: FxHashMap<Vec<usize>, usize> = FxHashMap::default();
-
-    let mut next_id: usize = initial_vocab_size;
-    let mut ids_to_merge: Vec<usize> = Vec::with_capacity(max_subtokens);
-
-    if ids[offset] != eot_token_id {
-        compressed_ids.push(eot_token_id);
-    }
-
-    let mut i = 0;
-    while offset + i < num_tokens && compressed_ids.len() < max_out_seq_length {
-        let id = ids[offset + i];
-
-        if disabled_ids.contains(&id) {
-            if ids_to_merge.len() > 0 {
-                push_to_compressed_ids(
-                    &mut compressed_ids,
-                    get_usize_from_codebook(&codebook, &ids_to_merge),
-                    max_out_seq_length,
-                );
-                ids_to_merge.clear();
-            }
-            push_to_compressed_ids(&mut compressed_ids, id, max_out_seq_length);
-            i += 1;
-            continue;
+    for (index, (ids, _)) in entries.iter().enumerate() {
+        if index >= config.max_codebook_size {
+            break;
         }
 
-        ids_to_merge.push(id);
-
-        let is_in_codebook = codebook_contains(&codebook, &ids_to_merge, initial_vocab_size);
-        if !is_in_codebook {
-            if next_id < initial_vocab_size + max_codebook_size {
-                codebook.insert(ids_to_merge.clone(), next_id);
-                next_id += 1;
-            }
-
-            ids_to_merge.pop();
-            push_to_compressed_ids(
-                &mut compressed_ids,
-                get_usize_from_codebook(&codebook, &ids_to_merge),
-                max_out_seq_length,
-            );
-            ids_to_merge.clear();
-            ids_to_merge.push(id);
-        }
-
-        if ids_to_merge.len() == max_subtokens {
-            push_to_compressed_ids(
-                &mut compressed_ids,
-                get_usize_from_codebook(&codebook, &ids_to_merge),
-                max_out_seq_length,
-            );
-            ids_to_merge.clear();
-        }
-
-        i += 1;
+        let start_idx = index * config.max_subtokens;
+        let end_idx = start_idx + ids.len().min(config.max_subtokens);
+        output[start_idx..end_idx].copy_from_slice(&ids[..ids.len().min(config.max_subtokens)]);
     }
 
-    if ids_to_merge.len() > max_subtokens {
-        let last_id = ids_to_merge.pop().unwrap();
-        push_to_compressed_ids(
-            &mut compressed_ids,
-            get_usize_from_codebook(&codebook, &ids_to_merge),
-            max_out_seq_length,
-        );
-        ids_to_merge.clear();
-        ids_to_merge.push(last_id);
-    }
-
-    if ids_to_merge.len() > 0 {
-        push_to_compressed_ids(
-            &mut compressed_ids,
-            get_usize_from_codebook(&codebook, &ids_to_merge),
-            max_out_seq_length,
-        );
-    }
-
-    let mut codebook_vec: Vec<usize> = codebook
-        .iter()
-        .sorted_by(|(_, value), (_, value2)| value.cmp(value2))
-        .flat_map(|(key, _)| {
-            let mut k = key.clone();
-            k.resize(max_subtokens, eot_token_id);
-            k
-        })
-        .collect::<Vec<usize>>();
-
-    codebook_vec.resize(max_codebook_size * max_subtokens, eot_token_id);
-
-    (compressed_ids, codebook_vec, i)
+    output
 }
 
 fn compress_file(filename: &str, args: &Args) {
@@ -198,7 +70,13 @@ fn compress_file(filename: &str, args: &Args) {
     assert!(header[1] == 1, "unsupported version");
     let num_tokens = header[2] as usize;
 
-    let disabled_ids = disabled_ids_to_set(Some(vec![args.eot_token_id]));
+    let compression_config = config::CompressionConfig::new(
+        args.initial_vocab_size,
+        args.max_codebook_size,
+        args.max_subtokens,
+        args.eot_token_id,
+        Some(vec![args.eot_token_id]),
+    );
 
     let mut compressed_ids: Vec<usize> = Vec::new();
     let mut codebook_vec: Vec<usize> = Vec::new();
@@ -206,17 +84,17 @@ fn compress_file(filename: &str, args: &Args) {
     let mut i: usize = 0;
     let mut pb = pbar(Some(num_tokens));
     while i < num_tokens && (num_tokens - i) > args.max_out_seq_length {
-        let (c_ids, c_codebook, remaining_ids_offset) = compress(
+        let mut compression_state = codec::CompressionState::new(compression_config.clone());
+
+        let (c_ids, remaining_ids_offset) = codec::encode_fn(
+            &mut compression_state,
             &ids,
             i,
-            num_tokens,
-            args.initial_vocab_size,
-            args.max_codebook_size,
-            args.max_subtokens,
-            args.max_out_seq_length,
-            args.eot_token_id,
-            &disabled_ids,
+            config::PaddingStrategy::DoNotPad,
+            true,
+            Some(args.max_out_seq_length),
         );
+
         let _ = pb.update(min(remaining_ids_offset, num_tokens - i));
         i += remaining_ids_offset;
 
@@ -226,7 +104,7 @@ fn compress_file(filename: &str, args: &Args) {
         }
 
         compressed_ids.extend(c_ids);
-        codebook_vec.extend(c_codebook);
+        codebook_vec.extend(convert_codebook_to_vec(&compression_state.codebook));
     }
     let _ = pb.close();
 
