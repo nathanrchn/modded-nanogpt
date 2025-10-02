@@ -95,15 +95,14 @@ fn compress_file(filename: &str, args: &Args) {
             Some(args.max_out_seq_length),
         );
 
-        let _ = pb.update(min(remaining_ids_offset, num_tokens - i));
-        i += remaining_ids_offset;
+        let _ = pb.update(min(remaining_ids_offset - i, num_tokens - i));
+        i = remaining_ids_offset;
 
         if c_ids.len() != args.max_out_seq_length {
             println!("c_ids.len(): {}", c_ids.len());
             return;
         }
 
-        compressed_ids.push(args.eot_token_id);
         compressed_ids.extend(c_ids);
         codebook_vec.extend(convert_codebook_to_vec(&compression_state.codebook));
     }
